@@ -130,6 +130,14 @@ describe("detectCommand", () => {
       expect(uaOpt).toBeDefined();
     });
 
+    it("should have redirect-policy option with default 'any'", () => {
+      const command = detectCommand();
+      const options = command.options;
+      const rpOpt = options.find((o) => o.long === "--redirect-policy");
+      expect(rpOpt).toBeDefined();
+      expect(rpOpt?.defaultValue).toBe("any");
+    });
+
   });
 
   describe("action execution", () => {
@@ -141,6 +149,7 @@ describe("detectCommand", () => {
         10000,
         expect.any(Array),
         undefined,
+        "any",
       );
     });
 
@@ -152,6 +161,7 @@ describe("detectCommand", () => {
         5000,
         expect.any(Array),
         undefined,
+        "any",
       );
     });
 
@@ -163,6 +173,31 @@ describe("detectCommand", () => {
         10000,
         expect.any(Array),
         "MyAgent/1.0",
+        "any",
+      );
+    });
+
+    it("should pass same-site redirect policy when provided", async () => {
+      await runCommand(["-r", "same-site"]);
+
+      expect(openPage).toHaveBeenCalledWith(
+        "https://example.com",
+        10000,
+        expect.any(Array),
+        undefined,
+        "same-site",
+      );
+    });
+
+    it("should pass same-host redirect policy when provided", async () => {
+      await runCommand(["--redirect-policy", "same-host"]);
+
+      expect(openPage).toHaveBeenCalledWith(
+        "https://example.com",
+        10000,
+        expect.any(Array),
+        undefined,
+        "same-host",
       );
     });
 
@@ -199,6 +234,12 @@ describe("detectCommand", () => {
       );
       expect(analyze).toHaveBeenCalledTimes(1);
       expect(vi.mocked(analyze).mock.calls[0]?.length).toBe(2);
+    });
+
+    it("should reject invalid redirect-policy value", async () => {
+      await runCommand(["--redirect-policy", "foo"]);
+
+      expect(openPage).not.toHaveBeenCalled();
     });
 
     it("should reject removed --scope option", async () => {

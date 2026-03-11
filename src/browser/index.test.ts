@@ -1,11 +1,13 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openPage } from "./index.js";
+import { RedirectPolicy } from "./types.js";
 
 // Mock playwright
 vi.mock("playwright", () => {
   const mockPage = {
     on: vi.fn(),
     goto: vi.fn(),
+    route: vi.fn(() => Promise.resolve()),
     context: vi.fn(),
     evaluate: vi.fn(),
     close: vi.fn(),
@@ -55,6 +57,7 @@ describe("openPage", () => {
   let mockPage: {
     on: ReturnType<typeof vi.fn>;
     goto: ReturnType<typeof vi.fn>;
+    route: ReturnType<typeof vi.fn>;
     context: ReturnType<typeof vi.fn>;
     evaluate: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
@@ -69,13 +72,16 @@ describe("openPage", () => {
     newContext: ReturnType<typeof vi.fn>;
     close: ReturnType<typeof vi.fn>;
   };
-  const mainFrame = {};
+  const mainFrame: { url: ReturnType<typeof vi.fn> } = {
+    url: vi.fn(() => "https://example.com"),
+  };
 
   beforeEach(() => {
     vi.clearAllMocks();
     mockPage = {
       on: vi.fn(),
       goto: vi.fn(() => Promise.resolve()),
+      route: vi.fn(() => Promise.resolve()),
       context: vi.fn(),
       evaluate: vi.fn(() => Promise.resolve({})),
       close: vi.fn(),
@@ -176,6 +182,22 @@ describe("openPage", () => {
       expect(result.timeoutOccurred).toBe(true);
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining("Timeout"),
+      );
+    });
+
+    it("should skip cookies and JS extraction when timeout occurs", async () => {
+      mockPage.goto.mockImplementation(
+        () => new Promise(() => {}), // Never resolves
+      );
+      vi.mocked(sleep).mockResolvedValue(undefined);
+
+      const result = await openPage("https://example.com", 1000, ["jQuery"]);
+
+      expect(result.timeoutOccurred).toBe(true);
+      expect(mockBrowserContext.cookies).not.toHaveBeenCalled();
+      expect(mockPage.evaluate).not.toHaveBeenCalled();
+      expect(logger.debug).toHaveBeenCalledWith(
+        "Skipping cookies/JavaScript extraction due to timeout",
       );
     });
   });
@@ -515,6 +537,7 @@ describe("openPage", () => {
           request: () => oldRequest,
         });
         // JS redirect causes navigation
+        mainFrame.url.mockReturnValue("https://redirected.test");
         capturedFramenavigatedCallback(mainFrame);
         // New page loads a resource
         capturedRequestCallback(newRequest);
@@ -565,6 +588,7 @@ describe("openPage", () => {
         // Request starts on old page
         capturedRequestCallback(oldRequest);
         // JS redirect causes navigation before response arrives
+        mainFrame.url.mockReturnValue("https://redirected.test");
         capturedFramenavigatedCallback(mainFrame);
         // New page loads
         capturedRequestCallback(newRequest);
@@ -620,6 +644,7 @@ describe("openPage", () => {
       const req1 = {};
       const req2 = {};
       mockPage.goto.mockImplementation(async () => {
+        mainFrame.url.mockReturnValue("https://redirected.test");
         capturedFramenavigatedCallback(mainFrame);
         capturedRequestCallback(req1);
         await capturedResponseCallback({
@@ -659,6 +684,458 @@ describe("openPage", () => {
       expect(logger.debug).toHaveBeenCalledWith(
         expect.stringContaining("Redirect detected"),
       );
+    });
+
+  });
+
+  describe("redirect policy", () => {
+    // Helper to create mock route objects for testing route handler
+    function createMockRoute(
+      url: string,
+      isNavigation: boolean,
+      frame: "main" | "sub" = "main",
+    ) {
+      const requestFrame =
+        frame === "main" ? mainFrame : { url: vi.fn(() => "https://iframe.test") };
+      return {
+        request: () => ({
+          url: () => url,
+          isNavigationRequest: () => isNavigation,
+          frame: () => requestFrame,
+        }),
+        abort: vi.fn(),
+        continue: vi.fn(),
+      };
+    }
+
+    // Helper to set up event callbacks and capture the route handler
+    function setupEventCapture() {
+      let capturedResponseCallback: (response: unknown) => Promise<void>;
+      let capturedRequestCallback: (request: unknown) => void;
+      let capturedFramenavigatedCallback: (frame: unknown) => void;
+      let capturedRouteHandler: ((route: ReturnType<typeof createMockRoute>) => void) | null = null;
+
+      mockPage.on.mockImplementation(
+        (event: string, callback: (...args: unknown[]) => void) => {
+          if (event === "response") {
+            capturedResponseCallback = callback as (response: unknown) => Promise<void>;
+          } else if (event === "request") {
+            capturedRequestCallback = callback as (request: unknown) => void;
+          } else if (event === "framenavigated") {
+            capturedFramenavigatedCallback = callback as (frame: unknown) => void;
+          }
+        },
+      );
+
+      mockPage.route.mockImplementation(
+        (_pattern: string, handler: (route: ReturnType<typeof createMockRoute>) => void) => {
+          capturedRouteHandler = handler;
+          return Promise.resolve();
+        },
+      );
+
+      vi.mocked(sleep).mockImplementation(
+        () => new Promise((resolve) => setTimeout(resolve, 100)),
+      );
+
+      return {
+        getResponseCb: () => capturedResponseCallback!,
+        getRequestCb: () => capturedRequestCallback!,
+        getFramenavigatedCb: () => capturedFramenavigatedCallback!,
+        getRouteHandler: () => capturedRouteHandler,
+      };
+    }
+
+    it("any should not register route handler", async () => {
+      setupEventCapture();
+
+      await openPage(
+        "https://example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.Any,
+      );
+
+      expect(mockPage.route).not.toHaveBeenCalled();
+    });
+
+    it("same-site should register route handler", async () => {
+      setupEventCapture();
+
+      await openPage(
+        "https://example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.SameSite,
+      );
+
+      expect(mockPage.route).toHaveBeenCalledWith("**/*", expect.any(Function));
+    });
+
+    it("same-site should allow redirect within same registrable domain", async () => {
+      const { getRouteHandler } = setupEventCapture();
+
+      await openPage(
+        "https://www.example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.SameSite,
+      );
+
+      const handler = getRouteHandler()!;
+
+      // First navigation (goto URL) — always allowed
+      const initialRoute = createMockRoute("https://www.example.com", true);
+      handler(initialRoute);
+      expect(initialRoute.continue).toHaveBeenCalled();
+
+      // Same-site redirect — allowed
+      const redirectRoute = createMockRoute("https://app.example.com/page", true);
+      handler(redirectRoute);
+      expect(redirectRoute.continue).toHaveBeenCalled();
+      expect(redirectRoute.abort).not.toHaveBeenCalled();
+    });
+
+    it("same-site should block cross-domain navigation", async () => {
+      const { getResponseCb, getRequestCb, getRouteHandler } = setupEventCapture();
+
+      const req = {};
+      mockPage.goto.mockImplementation(async () => {
+        // Original page loads resources
+        getRequestCb()(req);
+        await getResponseCb()({
+          url: () => "https://example.com/style.css",
+          status: () => 200,
+          headers: () => ({ "content-type": "text/css" }),
+          text: () => Promise.resolve("body{}"),
+          request: () => req,
+        });
+      });
+
+      // Browser stays on original page (navigation was blocked)
+      mockPage.url.mockReturnValue("https://example.com");
+
+      const result = await openPage(
+        "https://example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.SameSite,
+      );
+
+      // Verify route handler blocks cross-domain
+      const handler = getRouteHandler()!;
+      const initialRoute = createMockRoute("https://example.com", true);
+      handler(initialRoute); // consume first request
+      const crossDomainRoute = createMockRoute("https://different-site.test/page", true);
+      handler(crossDomainRoute);
+      expect(crossDomainRoute.abort).toHaveBeenCalled();
+      expect(crossDomainRoute.continue).not.toHaveBeenCalled();
+
+      // Original page responses are preserved
+      expect(result.responses).toHaveLength(1);
+      expect(result.responses[0]).toMatchObject({
+        url: "https://example.com/style.css",
+        isFirstParty: true,
+      });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("blocked by redirect policy"),
+      );
+    });
+
+    it("same-site should block cross-domain HTTP 3xx and log info", async () => {
+      const { getRouteHandler } = setupEventCapture();
+
+      // HTTP 3xx: the route handler is called during goto, blocking the redirect
+      mockPage.goto.mockImplementation(async () => {
+        const handler = getRouteHandler()!;
+
+        // First navigation request (initial goto URL) — allowed
+        const initialRoute = createMockRoute("https://example.com", true);
+        handler(initialRoute);
+        expect(initialRoute.continue).toHaveBeenCalled();
+
+        // 3xx redirect target — blocked
+        const redirectRoute = createMockRoute("https://different-site.test", true);
+        handler(redirectRoute);
+        expect(redirectRoute.abort).toHaveBeenCalled();
+
+        // goto fails because the redirect was aborted
+        throw new Error("net::ERR_ABORTED");
+      });
+
+      mockPage.url.mockReturnValue("https://example.com");
+
+      await openPage(
+        "https://example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.SameSite,
+      );
+
+      // Should log info (not error) when navigation was blocked by policy
+      expect(logger.info).toHaveBeenCalledWith(
+        "Page loaded (redirect blocked by policy)",
+      );
+    });
+
+    it("same-host should block redirect to different subdomain", async () => {
+      const { getRouteHandler } = setupEventCapture();
+
+      await openPage(
+        "https://www.example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.SameHost,
+      );
+
+      const handler = getRouteHandler()!;
+
+      // First request — allowed
+      const initialRoute = createMockRoute("https://www.example.com", true);
+      handler(initialRoute);
+      expect(initialRoute.continue).toHaveBeenCalled();
+
+      // Different subdomain — blocked by same-host
+      const subdomainRoute = createMockRoute("https://app.example.com/dashboard", true);
+      handler(subdomainRoute);
+      expect(subdomainRoute.abort).toHaveBeenCalled();
+      expect(subdomainRoute.continue).not.toHaveBeenCalled();
+    });
+
+    it("should always allow non-navigation requests regardless of host", async () => {
+      const { getRouteHandler } = setupEventCapture();
+
+      await openPage(
+        "https://example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.SameHost,
+      );
+
+      const handler = getRouteHandler()!;
+
+      // First navigation — allowed
+      const initialRoute = createMockRoute("https://example.com", true);
+      handler(initialRoute);
+
+      // Subresource from different host — always allowed
+      const subresourceRoute = createMockRoute("https://cdn.other-site.test/lib.js", false);
+      handler(subresourceRoute);
+      expect(subresourceRoute.continue).toHaveBeenCalled();
+      expect(subresourceRoute.abort).not.toHaveBeenCalled();
+    });
+
+    it("should always collect cookies and JS variables with redirect policy", async () => {
+      const { getResponseCb, getRequestCb, getRouteHandler } = setupEventCapture();
+
+      const mockCookies = [
+        {
+          name: "session",
+          value: "abc",
+          domain: "example.com",
+          path: "/",
+          expires: -1,
+          httpOnly: true,
+          secure: true,
+          sameSite: "Lax" as const,
+        },
+      ];
+
+      const req = {};
+      mockPage.goto.mockImplementation(async () => {
+        getRequestCb()(req);
+        await getResponseCb()({
+          url: () => "https://example.com/page",
+          status: () => 200,
+          headers: () => ({ "content-type": "text/html" }),
+          text: () => Promise.resolve("<html></html>"),
+          request: () => req,
+        });
+      });
+
+      mockPage.url.mockReturnValue("https://example.com");
+      mockPage.evaluate.mockResolvedValue({ jQuery: "3.6.0" });
+      mockBrowserContext.cookies.mockResolvedValue(mockCookies);
+
+      const result = await openPage(
+        "https://example.com",
+        10000,
+        ["jQuery"],
+        undefined,
+        RedirectPolicy.SameSite,
+      );
+
+      // Simulate that a cross-domain navigation was blocked by the route handler
+      const handler = getRouteHandler()!;
+      const initialRoute = createMockRoute("https://example.com", true);
+      handler(initialRoute);
+      const blockedRoute = createMockRoute("https://evil.test", true);
+      handler(blockedRoute);
+      expect(blockedRoute.abort).toHaveBeenCalled();
+
+      // Cookies and JS variables should be collected (browser is on correct page)
+      expect(mockBrowserContext.cookies).toHaveBeenCalled();
+      expect(mockPage.evaluate).toHaveBeenCalled();
+      expect(result.cookies).toHaveLength(1);
+      expect(result.cookies[0]).toMatchObject({ name: "session" });
+      expect(result.javascriptVariables).toEqual({ jQuery: "3.6.0" });
+    });
+
+    it("should select last in-scope generation when policy-blocked navigation occurs", async () => {
+      const { getResponseCb, getRequestCb, getFramenavigatedCb, getRouteHandler } =
+        setupEventCapture();
+
+      const inScopeReq = {};
+      const outOfScopeReq = {};
+      mockPage.goto.mockImplementation(async () => {
+        // Generation 0 (in-scope): response we want to keep.
+        getRequestCb()(inScopeReq);
+        await getResponseCb()({
+          url: () => "https://example.com/jquery-3.5.0.min.js",
+          status: () => 200,
+          headers: () => ({ "content-type": "text/javascript" }),
+          text: () => Promise.resolve("window.jQuery = {}"),
+          request: () => inScopeReq,
+        });
+
+        // Navigate to out-of-scope host and receive some responses there.
+        mainFrame.url.mockReturnValue("https://different-site.test");
+        getFramenavigatedCb()(mainFrame);
+        getRequestCb()(outOfScopeReq);
+        await getResponseCb()({
+          url: () => "https://different-site.test/app.js",
+          status: () => 200,
+          headers: () => ({ "content-type": "text/javascript" }),
+          text: () => Promise.resolve("console.log('out-of-scope')"),
+          request: () => outOfScopeReq,
+        });
+
+        // Then another out-of-scope top-level navigation is blocked.
+        const handler = getRouteHandler()!;
+        const initialRoute = createMockRoute("https://example.com", true, "main");
+        handler(initialRoute);
+        const blockedRoute = createMockRoute("https://evil.test", true, "main");
+        handler(blockedRoute);
+        expect(blockedRoute.abort).toHaveBeenCalled();
+      });
+
+      // Browser remains on out-of-scope URL at end of goto sequence.
+      mockPage.url.mockReturnValue("https://different-site.test");
+
+      const result = await openPage(
+        "https://example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.SameSite,
+      );
+
+      expect(result.responses).toHaveLength(1);
+      expect(result.responses[0]).toMatchObject({
+        url: "https://example.com/jquery-3.5.0.min.js",
+        host: "example.com",
+      });
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.stringContaining("Using in-scope generation"),
+      );
+    });
+
+    it("should select in-scope generation on timeout without policy-block flag", async () => {
+      const { getResponseCb, getRequestCb, getFramenavigatedCb } =
+        setupEventCapture();
+      vi.mocked(sleep).mockResolvedValue(undefined);
+
+      const inScopeReq = {};
+      const outOfScopeReq = {};
+      mockPage.goto.mockImplementation(async () => {
+        // Generation 0 (in-scope) has the evidence we want to keep.
+        getRequestCb()(inScopeReq);
+        await getResponseCb()({
+          url: () => "https://example.com/jquery-3.5.0.min.js",
+          status: () => 200,
+          headers: () => ({ "content-type": "text/javascript" }),
+          text: () => Promise.resolve("window.jQuery = {}"),
+          request: () => inScopeReq,
+        });
+
+        // Navigate to out-of-scope host before timeout occurs.
+        mainFrame.url.mockReturnValue("https://different-site.test");
+        getFramenavigatedCb()(mainFrame);
+        getRequestCb()(outOfScopeReq);
+        await getResponseCb()({
+          url: () => "https://different-site.test/app.js",
+          status: () => 200,
+          headers: () => ({ "content-type": "text/javascript" }),
+          text: () => Promise.resolve("console.log('out-of-scope')"),
+          request: () => outOfScopeReq,
+        });
+
+        // Keep goto pending so timeout wins the race.
+        return new Promise(() => {});
+      });
+
+      mockPage.url.mockReturnValue("https://different-site.test");
+
+      const result = await openPage(
+        "https://example.com",
+        1000,
+        [],
+        undefined,
+        RedirectPolicy.SameHost,
+      );
+
+      expect(result.timeoutOccurred).toBe(true);
+      expect(result.responses).toHaveLength(1);
+      expect(result.responses[0]).toMatchObject({
+        url: "https://example.com/jquery-3.5.0.min.js",
+        host: "example.com",
+      });
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.stringContaining("Using in-scope generation"),
+      );
+    });
+
+    it("any should allow cross-domain redirect (default behavior)", async () => {
+      const { getResponseCb, getRequestCb, getFramenavigatedCb } = setupEventCapture();
+
+      const req = {};
+      mockPage.goto.mockImplementation(async () => {
+        mainFrame.url.mockReturnValue("https://different-site.test");
+        getFramenavigatedCb()(mainFrame);
+        getRequestCb()(req);
+        await getResponseCb()({
+          url: () => "https://different-site.test/page",
+          status: () => 200,
+          headers: () => ({ "content-type": "text/html" }),
+          text: () => Promise.resolve("<html></html>"),
+          request: () => req,
+        });
+      });
+
+      mockPage.url.mockReturnValue("https://different-site.test");
+
+      const result = await openPage(
+        "https://example.com",
+        10000,
+        [],
+        undefined,
+        RedirectPolicy.Any,
+      );
+
+      // All redirects allowed
+      expect(result.responses).toHaveLength(1);
+      expect(result.responses[0]).toMatchObject({
+        url: "https://different-site.test/page",
+        isFirstParty: true,
+      });
     });
   });
 });
