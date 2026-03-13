@@ -216,42 +216,38 @@ export async function openPage(
   let cookies: Context["cookies"] = [];
   let javascriptVariables: Record<string, unknown> = {};
 
-  if (timeoutOccurred) {
-    logger.debug("Skipping cookies/JavaScript extraction due to timeout");
-  } else {
-    try {
-      cookies = (await page.context().cookies()).map((cookie) => {
-        const cookieHost = cookie.domain.replace(/^\./, "").toLowerCase();
-        return {
-          host: cookieHost,
-          isFirstParty: isFirstPartyHost(scopeHost, cookieHost),
-          name: cookie.name,
-          value: cookie.value,
-          domain: cookie.domain,
-          path: cookie.path,
-          expires: cookie.expires,
-          httpOnly: cookie.httpOnly,
-          secure: cookie.secure,
-          sameSite: cookie.sameSite,
-        };
-      });
+  try {
+    cookies = (await page.context().cookies()).map((cookie) => {
+      const cookieHost = cookie.domain.replace(/^\./, "").toLowerCase();
+      return {
+        host: cookieHost,
+        isFirstParty: isFirstPartyHost(scopeHost, cookieHost),
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path,
+        expires: cookie.expires,
+        httpOnly: cookie.httpOnly,
+        secure: cookie.secure,
+        sameSite: cookie.sameSite,
+      };
+    });
 
-      javascriptVariables = await page.evaluate(
-        ({ varNames, extractFn }) => {
-          // Re-create the function in browser context
-          const fn = new Function("return " + extractFn)();
-          return fn(window, varNames);
-        },
-        {
-          varNames: javascriptVariableNames,
-          extractFn: extractJsVariables.toString(),
-        },
-      );
-    } catch {
-      logger.warn(
-        "Failed to extract cookies or JavaScript variables (page context may have been destroyed)",
-      );
-    }
+    javascriptVariables = await page.evaluate(
+      ({ varNames, extractFn }) => {
+        // Re-create the function in browser context
+        const fn = new Function("return " + extractFn)();
+        return fn(window, varNames);
+      },
+      {
+        varNames: javascriptVariableNames,
+        extractFn: extractJsVariables.toString(),
+      },
+    );
+  } catch {
+    logger.warn(
+      "Failed to extract cookies or JavaScript variables (page context may have been destroyed)",
+    );
   }
 
   return {

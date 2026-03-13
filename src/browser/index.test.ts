@@ -185,21 +185,6 @@ describe("openPage", () => {
       );
     });
 
-    it("should skip cookies and JS extraction when timeout occurs", async () => {
-      mockPage.goto.mockImplementation(
-        () => new Promise(() => {}), // Never resolves
-      );
-      vi.mocked(sleep).mockResolvedValue(undefined);
-
-      const result = await openPage("https://example.com", 1000, ["jQuery"]);
-
-      expect(result.timeoutOccurred).toBe(true);
-      expect(mockBrowserContext.cookies).not.toHaveBeenCalled();
-      expect(mockPage.evaluate).not.toHaveBeenCalled();
-      expect(logger.debug).toHaveBeenCalledWith(
-        "Skipping cookies/JavaScript extraction due to timeout",
-      );
-    });
   });
 
   describe("error handling", () => {
